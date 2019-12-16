@@ -1,0 +1,375 @@
+---
+title: "Reanalysis of Pereire-Marques et al"
+author: "Andrew McArdle"
+date: "16 December 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+#Load libraries
+library(tidyverse)
+library(magrittr)
+library(stringi)
+library(DT)
+library(decontam)
+
+#Function to process kraken and bracken reports
+process_reports <- function(reports, base_names){
+  mapply(function(k, sample){
+    colnames(k) <- c("OTU_cum_prop", "OTU_count_cum", "OTU_count", "OTU_level", "taxid", "name")
+    spaces <- stri_extract_first_regex(k$name, "^[ ]+")
+    k$level <- nchar(spaces)
+    k$level[is.na(k$level)] <- 0
+    k$name <- trimws(k$name)
+    k$sample <- sample
+    total_reads <- sum(k$OTU_count)
+    metazoa_reads <- k[k$taxid == 33208, ]$OTU_count_cum
+    opisthokonta_reads <- k[k$taxid == 33154, ]$OTU_count
+    cellular_reads <- k[k$taxid == 131567, ]$OTU_count
+    eukaryota_reads <- k[k$taxid ==33154, ]$OTU_count
+    root_reads <- k[k$taxid == 1, ]$OTU_count
+    other_reads <- k[k$taxid == 28384, ]$OTU_count_cum
+    unclassified_reads <- k[k$taxid == 0, ]$OTU_count_cum
+    this_microbe_reads <- total_reads - metazoa_reads - unclassified_reads - other_reads - opisthokonta_reads - cellular_reads - root_reads - eukaryota_reads
+    k$OTU_cum_prop_microbe <- k$OTU_count_cum / this_microbe_reads
+    k
+  }, reports, base_names, SIMPLIFY=FALSE)
+}
+
+#Function to get parent OTU row of specified row
+get_parent_row <- function(table, org_row){
+  org_level <- table$level[org_row]
+  last(which(table$level[1:org_row] < org_level))
+}
+
+#Classify kraken/bracken OTUs
+#  Adds new columns:
+#     parent_OTU_count - how many reads assigned to parent OTU
+#     sibling_OTU_count_cum - how many reads assigned to siblings and their descendants
+#     type: match (target species), descendant (descendant of target species), sibling (other species within target genus), parent (target genus), ancestor (ancestor of target genera), co-descendant (descendant of sibling species), deep_other (off target species or deeper), shallow_other (off target genus or shallower), root, cellular organisms, mouse, other sequences, unclassified, root.
+classify_OTUs <- function(k){
+  samples <- unique(k$sample)
+  k$parent_OTU_count <- NA
+  k$sibling_OTU_count_cum <- NA
+  k$type <- NA
+  
+  #Create empty lists
+  sibling_counts <- list()
+  other_counts <- list()
+  other_counts_deep <- list()
+  other_counts_shallow <- list()
+  
+  #Iterate through samples
+  for (sample in samples){
+    match <- which(k$sample == sample)
+    all_siblings <- as.numeric()
+    all_orgs <- as.numeric()
+    exclude <- as.numeric()
+    cellular_organisms <- which(k[match,]$taxid == 131567)
+    #Iterate through organisms of interest
+    for(org in orgs[-1:-4]){
+      org_row <- which(k[match,]$name == org)
+      k[match[org_row],]$type <- "match"
+      org_level <- k[match[org_row], ]$level
+      parent_row <- get_parent_row(k[match,], org_row)
+      k[match[parent_row],]$type <- "parent"
+      ancestor_row <- parent_row
+      while(ancestor_row != cellular_organisms){
+        ancestor_row <- get_parent_row(k[match,], ancestor_row)
+        if(ancestor_row != cellular_organisms){
+          k[match[ancestor_row],]$type <- "ancestor"
+          exclude <- c(exclude, ancestor_row)
+        }
+      }
+      next_parent <- first(which(k[match,]$level[org_row:length(match)] < org_level)) + org_row - 1
+      siblings <- which(k[match[(parent_row+1):(next_parent-1)], ]$level == org_level ) + parent_row
+      siblings <- siblings[siblings != org_row]
+      k[match[siblings],]$type[is.na(k[match[siblings],]$type)] <- "sibling"
+      if(any(siblings > org_row)){
+        last_descendant <- min(siblings[siblings > org_row]) - 1
+      } else{
+        last_descendant <- next_parent - 1
+      }
+      if(last_descendant > org_row){
+        k[match[(org_row+1):last_descendant], ]$type <- "descendant"
+      }
+      k[match,]$type[parent_row:(next_parent-1)][is.na(k[match,]$type[parent_row:(next_parent-1)])] <- "co-descendant"
+      all_siblings <- c(all_siblings, siblings)
+      all_orgs <- c(all_orgs, org_row)
+      exclude <- c(exclude, parent_row:(next_parent-1))
+      k[match[org_row], ]$parent_OTU_count <- k[match[parent_row], ]$OTU_count
+      k[match[org_row], ]$sibling_OTU_count_cum <- sum(k[match[siblings], ]$OTU_count_cum)
+    }
+    all_siblings <- unique(all_siblings)
+    all_siblings <- all_siblings[!all_siblings %in% all_orgs]
+    exclude <- unique(exclude)
+    exclude <- c(exclude, which(k[match,]$taxid%in%c(0,28384)))
+    sibling_counts[sample] <- sum(k[match[all_siblings], ]$OTU_count_cum)
+    other_counts[sample] <- sum(k[match[-exclude],]$OTU_count) - k[k$sample == sample & k$taxid == 33208, ]$OTU_count_cum - sum(k[k$sample == sample & k$taxid %in% c(1,131567), ]$OTU_count)
+    other_counts_deep[sample] <- sum(filter(k[match[-exclude],], !substring(OTU_level,1,1) %in% c("U","R","D","K","P","C","O","F","G"))$OTU_count) - k[k$sample == sample & k$taxid == 33208, ]$OTU_count_cum
+    other_counts_shallow[sample] <- sum(filter(k[match[-exclude],], substring(OTU_level,1,1) %in% c("D","K","P","C","O","F","G"))$OTU_count)
+    k[match[-exclude],]$type[!substring(k[match[-exclude],]$OTU_level,1,1) %in% c("U","R","D","K","P","C","O","F","G") &! k[match[-exclude],]$taxid %in% meta_to_mouse] <- "deep_other"
+    k[match[-exclude],]$type[substring(k[match[-exclude],]$OTU_level,1,1) %in% c("D","K","P","C","O","F","G") &! k[match[-exclude],]$taxid %in% meta_to_mouse] <- "shallow_other"
+  }
+  k[k$taxid %in% meta_to_mouse, ]$type <- "mouse"
+  sibling_counts <- unlist(sibling_counts)
+  other_counts <- unlist(other_counts)
+  other_counts_shallow <- unlist(other_counts_shallow)
+  other_counts_deep <- unlist(other_counts_deep)
+  k$type[is.na(k$type)] <- k$name[is.na(k$type)]
+  
+  table(k$type, k$sample)
+  k$group <- ifelse(k$type %in% c("match", "descendant", "sibling", "co-descendant", "parent", "ancestor", "shallow_other", "deep_other"), "microbial", ifelse(k$type=="mouse", "host", "other"))
+  k$specificity <- ifelse(substring(k$OTU_level,1,1) %in% c("R","D","K","P","C","O","F","G"), "Genus and above", ifelse(substring(k$OTU_level,1,1) == "S", "Species and below", NA))
+  k
+}
+
+#List kraken and bracken reports
+kraken_report_files <- file.path("..", list.files("../", pattern="*kraken_report.txt"))
+bracken_report_files <- file.path("..", list.files("../", pattern="*kraken_report_bracken.txt"))
+
+#Extract base names
+kraken_base_names <- substring(kraken_report_files, 4, stri_locate_first_regex(kraken_report_files, "[_]kraken[_]report([_]bracken)?[.]txt")[,1]-1)
+bracken_base_names <- substring(bracken_report_files, 4, stri_locate_first_regex(bracken_report_files, "[_]kraken[_]report([_]bracken)?[.]txt")[,1]-1)
+
+#Read in report files
+kraken_reports <- lapply(kraken_report_files, read.table, sep="\t", header=FALSE, stringsAsFactors=FALSE, quote="")
+bracken_reports <- lapply(bracken_report_files, read.table, sep="\t", header=FALSE, stringsAsFactors=FALSE, quote="")
+
+#Process reports
+kraken_reports %<>% process_reports(kraken_base_names)
+bracken_reports %<>% process_reports(bracken_base_names)
+
+kraken <- bind_rows(kraken_reports)
+bracken <- bind_rows(bracken_reports)
+
+kraken$name[kraken$name=="Cutibacterium acnes"] <- "Propionibacterium acnes"
+kraken$name[kraken$name=="Schaalia odontolytica"] <- "Actinobacterium odontolyticus"
+bracken$name[bracken$name=="Cutibacterium acnes"] <- "Propionibacterium acnes"
+bracken$name[bracken$name=="Schaalia odontolytica"] <- "Actinobacterium odontolyticus"
+
+#OTUs of interest
+orgs <- c("Bacteria", "Viruses", "Fungi", "Archaea", "Rhodobacter sphaeroides", "Streptococcus mutans", "Staphylococcus epidermidis", "Escherichia coli", "Pseudomonas aeruginosa", "Staphylococcus aureus", "Streptococcus agalactiae", "Bacillus cereus", "Clostridium beijerinckii", "Helicobacter pylori", "Propionibacterium acnes", "Neisseria meningitidis", "Acinetobacter baumannii", "Listeria monocytogenes", "Lactobacillus gasseri", "Actinobacterium odontolyticus", "Deinococcus radiodurans", "Streptococcus pneumoniae", "Enterococcus faecalis", "Bacteroides vulgatus")
+
+#Genome sizes (Mb; NCBI)
+genome_size <- list("Rhodobacter sphaeroides" = 4.60479, "Streptococcus mutans" = 1.96197, "Staphylococcus epidermidis" = 2.51877, "Escherichia coli" = 5.12901, "Pseudomonas aeruginosa" = 6.59693, "Staphylococcus aureus" = 2.83719, "Streptococcus agalactiae" = 2.08158, "Bacillus cereus" = 5.75671, "Clostridium beijerinckii" = 5.996, "Helicobacter pylori" = 1.63218, "Propionibacterium acnes" = 2.50547, "Neisseria meningitidis" = 2.13082, "Acinetobacter baumannii" = 3.97355, "Listeria monocytogenes" = 2.97382, "Lactobacillus gasseri" = 1.92244, "Actinobacterium odontolyticus"=2.37704, "Deinococcus radiodurans" = 3.24181, "Streptococcus pneumoniae" = 2.086, "Enterococcus faecalis" = 2.96365, "Bacteroides vulgatus" = 5.05011)
+GC_content <- list("Rhodobacter sphaeroides" = 0.68939, "Streptococcus mutans" = 0.368, "Staphylococcus epidermidis" = 0.32, "Escherichia coli" = 0.506, "Pseudomonas aeruginosa" = 0.662, "Staphylococcus aureus" = 0.327, "Streptococcus agalactiae" = 0.354, "Bacillus cereus" = 0.35005, "Clostridium beijerinckii" = 0.2965, "Helicobacter pylori" = 0.389, "Propionibacterium acnes" = 0.601, "Neisseria meningitidis" = 0.517, "Acinetobacter baumannii" = 0.39, "Listeria monocytogenes" = 0.369, "Lactobacillus gasseri" = 0.349, "Actinobacterium odontolyticus"=0.654, "Deinococcus radiodurans" = 0.666184, "Streptococcus pneumoniae" = 0.396, "Enterococcus faecalis" = 0.375, "Bacteroides vulgatus" = 0.422)
+
+#True abundances as per Pereira-Marques et al.
+true_abundance <- list("Rhodobacter sphaeroides" = 0.3443, "Streptococcus mutans" = 0.2066, "Staphylococcus epidermidis" = 0.2066, "Escherichia coli" = 0.1475, "Pseudomonas aeruginosa" = 0.0258, "Staphylococcus aureus" = 0.0207, "Streptococcus agalactiae" = 0.0148, "Bacillus cereus" = 0.0086, "Clostridium beijerinckii" = 0.0074, "Helicobacter pylori" = 0.0052, "Propionibacterium acnes" = 0.0034, "Neisseria meningitidis" = 0.0026, "Acinetobacter baumannii" = 0.0017, "Listeria monocytogenes" = 0.0017, "Lactobacillus gasseri" = 0.0017, "Actinobacterium odontolyticus"=0.0005, "Deinococcus radiodurans" = 0.0003, "Streptococcus pneumoniae" = 0.0003, "Enterococcus faecalis" = 0.0003, "Bacteroides vulgatus" = 0.0001)
+
+#MetaPhlAn abundances as per Pereira-Marques et al.
+MetaPhlAn_abundance <- list("Rhodobacter sphaeroides" = 0.1279, "Streptococcus mutans" = 0.3621, "Staphylococcus epidermidis" = 0.2710, "Escherichia coli" = 0.1081, "Pseudomonas aeruginosa" = 0.0147, "Staphylococcus aureus" = 0.0427, "Streptococcus agalactiae" = 0.0280, "Bacillus cereus" = 0.0099, "Clostridium beijerinckii" = 0.0114, "Helicobacter pylori" = 0.0081, "Propionibacterium acnes" = 0.0019, "Neisseria meningitidis" = 0.0020, "Acinetobacter baumannii" = 0.0019, "Listeria monocytogenes" = 0.0016, "Lactobacillus gasseri" = 0.0023, "Actinobacterium odontolyticus"=0.0002, "Deinococcus radiodurans" = 0.0002, "Streptococcus pneumoniae" = 0.0004, "Enterococcus faecalis" = 0.0004, "Bacteroides vulgatus" = 0.0002)
+
+kraken$genome_size <- unlist(genome_size)[match(kraken$name,names(genome_size))]
+bracken$genome_size <- unlist(genome_size)[match(bracken$name,names(genome_size))]
+kraken$OTU_count_corrected <- kraken$OTU_count / kraken$genome_size
+kraken$OTU_count_cum_corrected <- kraken$OTU_count_cum / kraken$genome_size
+bracken$OTU_count_corrected <- bracken$OTU_count / bracken$genome_size
+bracken$OTU_count_cum_corrected <- bracken$OTU_count_cum / bracken$genome_size
+
+#OTUs from mouse to metazoa
+meta_to_mouse <- c(33208, 6072, 33213, 33511, 7711, 89593, 7742, 7776, 117570, 117571, 8287, 1338369, 32523, 32524, 40674, 32525, 9347, 1437010, 314146, 314147, 9989, 1963758, 337687, 10066, 39107, 10088, 862507, 10090)
+
+#Classify OTUs
+kraken %<>% classify_OTUs()
+bracken %<>% classify_OTUs()
+
+#Create summary tables
+match_summary_table <- function(k, corrected=FALSE){
+  #Summarise 
+  k_matches <- filter(k, group == "microbial" & type=="match" & substring(OTU_level, 1, 1) == "S") %>%
+    mutate(type=ifelse(type=="match", name, ifelse(type=="descendant", "descendant", "other"))) %>%
+    group_by(sample, type) %>%
+    summarise(OTU_count=sum(ifelse(corrected, OTU_count_cum_corrected, OTU_count_cum))) %>%
+    spread(type, OTU_count) %>%
+    ungroup() %>%
+    mutate(other=0) %>%
+    mutate(total=rowSums(.[,-1]))
+  k_matches <- k_matches[,-which(colnames(k_matches)=="other")]
+  k_matches_counts <- gather(k_matches, key="organism", value="read_counts",-sample)
+  k_matches[nrow(k_matches)+1,-1] <- c(unlist(true_abundance)[match(colnames(k_matches)[c(-1,-ncol(k_matches))], 
+                                  names(true_abundance))], sum(unlist(true_abundance)))
+  k_matches[nrow(k_matches),1] <- "Actual"
+  k_matches[nrow(k_matches)+1,-1] <- c(
+    unlist(MetaPhlAn_abundance)[match(colnames(k_matches)[c(-1,-ncol(k_matches))],
+    names(MetaPhlAn_abundance))], sum(unlist(MetaPhlAn_abundance)))
+  k_matches[nrow(k_matches),1] <- "MetaPhlAn"
+  k_matches[1:(nrow(k_matches)-1),-c(1,ncol(k_matches))]<- k_matches[1:(nrow(k_matches)-1),-c(1,ncol(k_matches))]/k_matches$total[1:(nrow(k_matches)-1)]
+  k_matches <- k_matches[,-ncol(k_matches)]
+  k_matches %<>% gather(key="organism", value="relative_abundance",-sample)
+  k_matches$organism <- factor(k_matches$organism, levels=rev(orgs[-1:-4]), ordered=TRUE)
+  list(k_matches, k_matches_counts)
+}
+
+tmp <- match_summary_table(kraken, corrected=TRUE)
+kraken_matches_corrected <- tmp[[1]]
+kraken_matches_counts_corrected <- tmp[[2]]
+tmp <- match_summary_table(bracken, corrected=TRUE)
+bracken_matches_corrected <- tmp[[1]]
+bracken_matches_counts_corrected <- tmp[[2]]
+tmp <- match_summary_table(bracken, corrected=FALSE)
+bracken_matches <- tmp[[1]]
+bracken_matches_counts <- tmp[[2]]
+
+```
+
+## Comparison of relative abundances of Bracken reads (uncorrected for genome size)
+
+```{r}
+ggplot(filter(bracken_matches, sample != "MetaPhlAn"), aes(x = sample, y = organism)) +
+  geom_tile(aes(fill = relative_abundance*100))+
+  scale_fill_gradient2(trans="log", breaks=c(0,0.1,1,20,40), name="Relative abundance (%)", low="#f1dc87ff", mid="#eb9486ff", high="#67345bff")+
+  xlab("")+
+  ylab("Organism")+
+  theme(panel.background = element_blank())
+```
+
+##Comparison of SS99 and MS (corrected for genome size)
+```{r}
+bracken_matches_s <- spread(bracken_matches_corrected, sample, relative_abundance)
+bracken_matches_counts$organism <- factor(bracken_matches_counts_corrected$organism, levels=rev(orgs[-1:-4]), ordered=TRUE)
+bracken_matches_counts_s <- spread(bracken_matches_counts_corrected, sample, read_counts)
+bracken_matches_s$MS_rel <- round(bracken_matches_s$MS / bracken_matches_s$Actual,2)
+bracken_matches_s$SS99_MS_rel <- round(bracken_matches_s$SS99 / bracken_matches_s$MS,2)
+print("Median of SS99/MS relative values")
+median(bracken_matches_s$SS99_MS_rel)
+print("Range of SS99/MS relative values")
+range(bracken_matches_s$SS99_MS_rel)
+print("Number with difference <= 10% (SS99/MS relative)")
+length(which(abs(bracken_matches_s$SS99_MS_rel - 1)<=0.10))
+print("Mean squared relative error (SS99/MS relative)")
+mean((1-bracken_matches_s$SS99_MS_rel)^2)
+```
+
+##Mean squared relative error for bracken (MS) and MetaPhlAn
+```{r}
+print("Bracken")
+mean((1-(bracken_matches_s$MS/bracken_matches_s$Actual))^2)
+print("MetaPhlAn")
+mean((1-(bracken_matches_s$MetaPhlAn/bracken_matches_s$Actual))^2)
+```
+##Comparison of SS99 and true abundances
+```{r}
+print("Median of estimated/actual relative abundances (MS)")
+median(bracken_matches_s$MS_rel)
+print("Range of estimated/actual relative abundances (MS)")
+range(bracken_matches_s$MS_rel)
+print("Number with ratio between 0.5 and 2")
+length(which(bracken_matches_s$MS_rel <= 2 & bracken_matches_s$MS_rel >= 0.5))
+```
+
+##GC content
+```{r}
+bracken_matches_s$GC_content <- unlist(GC_content)[match(bracken_matches_s$organism, names(GC_content))]
+
+ggplot(bracken_matches_s, aes(x=GC_content, y=MS_rel))+
+  geom_point()
+```
+```{r}
+print("r value")
+cor(bracken_matches_s$MS_rel, bracken_matches_s$GC_content)
+```
+
+##Kraken read allocations by group
+```{r, include=FALSE}
+kraken_match_total <- group_by(kraken, sample, type) %>%
+  summarise(total_reads=sum(OTU_count)) %>%
+  spread(type, total_reads) %>%
+  ungroup() %>%
+  mutate(total_reads=rowSums(.[,-1]),
+         on_target_reads=match+descendant,
+         sibling_reads=sibling+`co-descendant`,
+         ignored_reads=`cellular organisms` + root + `other sequences` + unclassified,
+         murine_reads=mouse,
+         microbial_reads=total_reads-murine_reads-ignored_reads,
+         on_target_prop=on_target_reads/microbial_reads,
+         parent_prop=parent/microbial_reads,
+         ancestor_prop=ancestor/microbial_reads,
+         sibling_prop=sibling_reads/microbial_reads,
+         deep_other_prop=deep_other/microbial_reads,
+         shallow_other_prop=shallow_other/microbial_reads)
+kraken_match_total_t <- t(kraken_match_total[,-1])
+colnames(kraken_match_total_t) <- kraken_match_total$sample
+datatable(kraken_match_total_t)
+```
+
+##Contaminants
+```{r}
+other <- bracken[bracken$OTU_level=="G" & bracken$type=="shallow_other",c("sample", "taxid", "name", "OTU_count_cum")] %>%
+  spread(sample, OTU_count_cum, fill=0)
+other$diff <- other$MS / other$SS99
+other$diff[is.nan(other$diff)] <- 100000
+other$host_assoc <- ifelse(other$diff > 10, "MS abundant", ifelse(other$diff < 0.1, "Spiked abundant", "Shared"))
+table(other$host_assoc)
+
+print("Proportion of off-target genera reads by sample from host-associated or synthetic-associated genera")
+colSums(other[other$host_assoc!="Shared",c("MS","SS10","SS90","SS99")]) / colSums(other[,c("MS","SS10","SS90","SS99")])
+
+print("Proportion of off-target genera overall reads from host-associated or synthetic-associated genera")
+sum(other[other$host_assoc!="Shared",c("MS","SS10","SS90","SS99")]) / sum(other[,c("MS","SS10","SS90","SS99")])
+
+microbial_reads <- group_by(bracken, sample, type) %>%
+  summarise(total_reads=sum(OTU_count)) %>%
+  spread(type, total_reads) %>%
+  ungroup() %>%
+  mutate(total_reads=rowSums(.[,-1]),
+         ignored_reads=`cellular organisms` + root + `other sequences` + unclassified,
+         murine_reads=mouse,
+         microbial_reads=total_reads-murine_reads-ignored_reads) %>%
+  select(sample, microbial_reads)
+
+print("Proportion of reads by sample from host-associated genera")
+colSums(other[other$host_assoc=="Spiked abundant",c("MS","SS10","SS90","SS99")]) / microbial_reads$microbial_reads
+
+print("Proportion of reads by sample from synthetic-associated genera")
+colSums(other[other$host_assoc=="MS abundant",c("MS","SS10","SS90","SS99")]) / microbial_reads$microbial_reads
+
+```
+
+##Decontam
+```{r}
+bracken_species <- filter(bracken, OTU_level == "S", taxid!=10090) %>%
+  select(taxid, sample, OTU_count) %>%
+  spread(taxid, OTU_count, fill=0)
+row.names(bracken_species) <- bracken_species[,1]
+bracken_species <- bracken_species[,-1]
+bracken_species %<>% as.matrix()
+
+bracken_iscontam <- isContaminant(bracken_species, rowSums(bracken_species), method="frequency", threshold=0.5)
+
+contaminant_taxids <- rownames(bracken_iscontam)[bracken_iscontam$contaminant]
+
+bracken$contaminant <- bracken$taxid %in% contaminant_taxids
+
+print("How many target species classified as contaminants")
+length(which(bracken[bracken$name %in% orgs[-1:-4], ]$contaminant))
+
+print("Contaminant OTU counts")
+table(bracken_iscontam$contaminant)
+
+print("Reads accounted for by species classified as contaminants")
+filter(bracken, contaminant) %>%
+  group_by(sample) %>%
+  summarise(reads=sum(OTU_count))
+
+bracken_match_total <- filter(bracken, substring(OTU_level,1,1)=="S") %>%
+  mutate(type=ifelse(contaminant, "contaminant", type)) %>%
+  group_by(sample, type) %>%
+  summarise(total_reads=sum(OTU_count)) %>%
+  spread(type, total_reads) %>%
+  ungroup() %>%
+  mutate(total_reads=rowSums(.[,-1]),
+         on_target_reads=match,
+         sibling_reads=sibling,
+         murine_reads=mouse,
+         microbial_reads=total_reads-murine_reads,
+         on_target_prop=on_target_reads/microbial_reads,
+         sibling_prop=sibling_reads/microbial_reads,
+         deep_other_prop=deep_other/microbial_reads
+  )
+bracken_match_total$contaminant_proportion_of_off_target <- bracken_match_total$contaminant / (bracken_match_total$microbial_reads - bracken_match_total$on_target_reads - bracken_match_total$sibling_reads - bracken_match_total$`co-descendant`)
+datatable(bracken_match_total, options = list(scrollX = TRUE))
+
+```
